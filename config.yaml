@@ -1,0 +1,39 @@
+server:
+  host: "0.0.0.0"
+  port: 8090
+
+storage:
+  data_dir: "./data"
+
+imdb:
+  base_url: "https://datasets.imdbws.com"
+  auto_update: true
+  check_interval_hours: 24
+
+indexing:
+  # Memory budget for Tantivy writer in Megabytes (strictly limits RAM usage!)
+  writer_memory_budget_mb: 50
+  batch_size: 10000
+  # Allowed titleTypes (empty list means all types: movie, tvSeries, tvEpisode, etc.)
+  allowed_title_types: []
+  noise_filter:
+    enabled: true
+    min_votes: 0
+    filter_empty_titles: true
+    filter_zero_votes_no_year: true
+
+search:
+  default_limit: 20
+  max_limit: 100
+  popularity_boost_weight: 2.0
+  rating_boost_weight: 0.5
+
+tmdb:
+  # TMDB API Key / Read Access Token (or set TMDB_API_KEY environment variable)
+  api_key: "db85bce5bf5bf9bac3c140447bf5ac5d"
+  # Default poster size: w92 (xs), w154 (sm), w185 (md), w342, w500 (lg), original
+  default_size: "w185"
+  cache_dir: "./data/posters"
+  cache_ttl_days: 30
+  negative_cache_hours: 24
+
