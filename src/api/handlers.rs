@@ -402,6 +402,7 @@ pub async fn get_home_feeds_handler(
 #[derive(Debug, serde::Deserialize)]
 pub struct ShelfPageQuery {
     pub page: Option<u32>,
+    pub r#type: Option<String>,
 }
 
 pub async fn get_shelf_page_handler(
@@ -410,7 +411,7 @@ pub async fn get_shelf_page_handler(
     Query(query): Query<ShelfPageQuery>,
 ) -> impl IntoResponse {
     let page = query.page.unwrap_or(1).max(1);
-    match state.poster_service.get_shelf_page(&shelf_id, page).await {
+    match state.poster_service.get_shelf_page(&shelf_id, query.r#type.as_deref(), page).await {
         Ok(Some(shelf)) => Json(shelf).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -426,6 +427,23 @@ pub async fn get_shelf_page_handler(
             .into_response(),
     }
 }
+
+pub async fn get_catalog_discover_handler(
+    State(state): State<AppState>,
+    Query(params): Query<crate::poster::DiscoverParams>,
+) -> impl IntoResponse {
+    match state.poster_service.discover_catalog(&params).await {
+        Ok(shelf) => Json(shelf).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("Failed to discover catalog: {}", e)
+            })),
+        )
+            .into_response(),
+    }
+}
+
 
 
 

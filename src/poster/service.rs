@@ -1196,7 +1196,7 @@ impl PosterService {
             return Ok(Vec::new());
         }
 
-        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let _today = chrono::Utc::now().format("%Y-%m-%d").to_string();
 
         let urls = vec![
             (
@@ -1207,28 +1207,25 @@ impl PosterService {
                 "movie",
             ),
             (
-                "digital",
-                "Свежие цифровые релизы",
-                "film",
-                format!(
-                    "https://api.themoviedb.org/3/discover/movie?language=ru-RU&sort_by=primary_release_date.desc&release_date.lte={}&with_release_type=4%7C5&vote_count.gte=30",
-                    today
-                ),
-                "movie",
+                "apple_tv",
+                "Apple TV+ Originals",
+                "star",
+                "https://api.themoviedb.org/3/discover/tv?language=ru-RU&with_networks=2552&sort_by=popularity.desc".to_string(),
+                "tv",
             ),
             (
                 "popular_series",
                 "Популярные сериалы",
                 "tv",
-                "https://api.themoviedb.org/3/tv/popular?language=ru-RU".to_string(),
+                "https://api.themoviedb.org/3/discover/tv?language=ru-RU&sort_by=popularity.desc&without_genres=10763,10764,10766,10767&vote_count.gte=50".to_string(),
                 "tv",
             ),
             (
-                "top_rated",
-                "Шедевры всех времён",
+                "hbo_max",
+                "HBO / Max Originals",
                 "star",
-                "https://api.themoviedb.org/3/movie/top_rated?language=ru-RU&vote_count.gte=1000".to_string(),
-                "movie",
+                "https://api.themoviedb.org/3/discover/tv?language=ru-RU&with_networks=49&sort_by=popularity.desc".to_string(),
+                "tv",
             ),
         ];
 
@@ -1278,8 +1275,9 @@ impl PosterService {
     }
 
     /// Fetches a specific page (20 items) for a given shelf ID with in-memory caching
-    pub async fn get_shelf_page(&self, shelf_id: &str, page: u32) -> Result<Option<FeedShelf>> {
-        let cache_key = format!("{}:{}", shelf_id, page);
+    pub async fn get_shelf_page(&self, shelf_id: &str, media_type: Option<&str>, page: u32) -> Result<Option<FeedShelf>> {
+        let type_key = media_type.unwrap_or("default");
+        let cache_key = format!("{}:{}:{}", shelf_id, type_key, page);
         {
             let mut cache = self.shelf_pages_cache.lock().unwrap();
             if let Some((ts, shelf)) = cache.get(&cache_key) {
@@ -1295,35 +1293,161 @@ impl PosterService {
         }
 
         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let is_tv = media_type == Some("tv");
 
         let (title, icon, url, def_type) = match shelf_id {
-            "trending" => (
-                "В тренде на этой неделе",
-                "flame",
-                format!("https://api.themoviedb.org/3/trending/all/week?language=ru-RU&page={}", page),
-                "movie",
-            ),
-            "digital" => (
-                "Свежие цифровые релизы",
-                "film",
-                format!(
-                    "https://api.themoviedb.org/3/discover/movie?language=ru-RU&sort_by=primary_release_date.desc&release_date.lte={}&with_release_type=4%7C5&vote_count.gte=30&page={}",
-                    today, page
-                ),
-                "movie",
-            ),
+            "trending" => {
+                if is_tv {
+                    (
+                        "В тренде на этой неделе",
+                        "flame",
+                        format!("https://api.themoviedb.org/3/trending/tv/week?language=ru-RU&page={}", page),
+                        "tv",
+                    )
+                } else {
+                    (
+                        "В тренде на этой неделе",
+                        "flame",
+                        format!("https://api.themoviedb.org/3/trending/movie/week?language=ru-RU&page={}", page),
+                        "movie",
+                    )
+                }
+            }
+            "digital" => {
+                if is_tv {
+                    (
+                        "Свежие сезоны сериалов",
+                        "film",
+                        format!(
+                            "https://api.themoviedb.org/3/discover/tv?language=ru-RU&sort_by=first_air_date.desc&first_air_date.lte={}&without_genres=10763,10764,10766,10767&vote_count.gte=30&page={}",
+                            today, page
+                        ),
+                        "tv",
+                    )
+                } else {
+                    (
+                        "Свежие цифровые релизы",
+                        "film",
+                        format!(
+                            "https://api.themoviedb.org/3/discover/movie?language=ru-RU&sort_by=primary_release_date.desc&release_date.lte={}&with_release_type=4%7C5&vote_count.gte=30&page={}",
+                            today, page
+                        ),
+                        "movie",
+                    )
+                }
+            }
             "popular_series" => (
                 "Популярные сериалы",
                 "tv",
-                format!("https://api.themoviedb.org/3/tv/popular?language=ru-RU&page={}", page),
+                format!(
+                    "https://api.themoviedb.org/3/discover/tv?language=ru-RU&sort_by=popularity.desc&without_genres=10763,10764,10766,10767&vote_count.gte=50&page={}",
+                    page
+                ),
                 "tv",
             ),
-            "top_rated" => (
-                "Шедевры всех времён",
-                "star",
-                format!("https://api.themoviedb.org/3/movie/top_rated?language=ru-RU&vote_count.gte=1000&page={}", page),
-                "movie",
-            ),
+            "top_rated" => {
+                if is_tv {
+                    (
+                        "Шедевры сериалов (Топ)",
+                        "star",
+                        format!(
+                            "https://api.themoviedb.org/3/tv/top_rated?language=ru-RU&without_genres=10763,10764,10766,10767&vote_count.gte=300&page={}",
+                            page
+                        ),
+                        "tv",
+                    )
+                } else {
+                    (
+                        "Шедевры всех времён",
+                        "star",
+                        format!("https://api.themoviedb.org/3/movie/top_rated?language=ru-RU&vote_count.gte=1000&page={}", page),
+                        "movie",
+                    )
+                }
+            }
+            "apple_tv" => {
+                if !is_tv && media_type == Some("movie") {
+                    (
+                        "Apple TV+ Фильмы",
+                        "film",
+                        format!(
+                            "https://api.themoviedb.org/3/discover/movie?language=ru-RU&with_watch_providers=350&watch_region=US&sort_by=popularity.desc&vote_count.gte=20&page={}",
+                            page
+                        ),
+                        "movie",
+                    )
+                } else {
+                    (
+                        "Apple TV+ Originals",
+                        "tv",
+                        format!("https://api.themoviedb.org/3/discover/tv?language=ru-RU&with_networks=2552&sort_by=popularity.desc&page={}", page),
+                        "tv",
+                    )
+                }
+            }
+            "hbo_max" => {
+                if !is_tv && media_type == Some("movie") {
+                    (
+                        "HBO / Max Фильмы",
+                        "film",
+                        format!(
+                            "https://api.themoviedb.org/3/discover/movie?language=ru-RU&with_watch_providers=1899%7C384&watch_region=US&sort_by=popularity.desc&vote_count.gte=30&page={}",
+                            page
+                        ),
+                        "movie",
+                    )
+                } else {
+                    (
+                        "HBO / Max Originals",
+                        "tv",
+                        format!("https://api.themoviedb.org/3/discover/tv?language=ru-RU&with_networks=49&sort_by=popularity.desc&page={}", page),
+                        "tv",
+                    )
+                }
+            }
+            "netflix" => {
+                if !is_tv && media_type == Some("movie") {
+                    (
+                        "Netflix Фильмы",
+                        "film",
+                        format!(
+                            "https://api.themoviedb.org/3/discover/movie?language=ru-RU&with_watch_providers=8&watch_region=US&sort_by=popularity.desc&vote_count.gte=30&page={}",
+                            page
+                        ),
+                        "movie",
+                    )
+                } else {
+                    (
+                        "Netflix Хиты",
+                        "tv",
+                        format!(
+                            "https://api.themoviedb.org/3/discover/tv?language=ru-RU&with_networks=213&sort_by=popularity.desc&without_genres=10763,10764,10767&vote_count.gte=50&page={}",
+                            page
+                        ),
+                        "tv",
+                    )
+                }
+            }
+            "amazon_prime" => {
+                if !is_tv && media_type == Some("movie") {
+                    (
+                        "Amazon Prime Фильмы",
+                        "film",
+                        format!(
+                            "https://api.themoviedb.org/3/discover/movie?language=ru-RU&with_watch_providers=119%7C9&watch_region=US&sort_by=popularity.desc&vote_count.gte=30&page={}",
+                            page
+                        ),
+                        "movie",
+                    )
+                } else {
+                    (
+                        "Amazon Prime Video",
+                        "tv",
+                        format!("https://api.themoviedb.org/3/discover/tv?language=ru-RU&with_networks=1024&sort_by=popularity.desc&vote_count.gte=50&page={}", page),
+                        "tv",
+                    )
+                }
+            }
             _ => return Ok(None),
         };
 
@@ -1360,6 +1484,136 @@ impl PosterService {
         }
 
         Ok(Some(shelf))
+    }
+
+    /// Flexible discovery with multi-criteria filters: network, genres, countries, years, rating
+    pub async fn discover_catalog(&self, params: &DiscoverParams) -> Result<FeedShelf> {
+        let is_tv = params.r#type.as_deref() == Some("tv");
+        let def_type = if is_tv { "tv" } else { "movie" };
+        let page = params.page.unwrap_or(1).max(1);
+
+        let mut base_url = if is_tv {
+            format!("https://api.themoviedb.org/3/discover/tv?language=ru-RU&page={}", page)
+        } else {
+            format!("https://api.themoviedb.org/3/discover/movie?language=ru-RU&page={}", page)
+        };
+
+        // Networks / Providers
+        if let Some(ref net) = params.network {
+            match net.to_lowercase().as_str() {
+                "apple" | "apple_tv" => {
+                    if is_tv {
+                        base_url.push_str("&with_networks=2552");
+                    } else {
+                        base_url.push_str("&with_watch_providers=350&watch_region=US");
+                    }
+                }
+                "hbo" | "hbo_max" | "max" => {
+                    if is_tv {
+                        base_url.push_str("&with_networks=49");
+                    } else {
+                        base_url.push_str("&with_watch_providers=1899|384&watch_region=US");
+                    }
+                }
+                "netflix" => {
+                    if is_tv {
+                        base_url.push_str("&with_networks=213");
+                    } else {
+                        base_url.push_str("&with_watch_providers=8&watch_region=US");
+                    }
+                }
+                "amazon" | "prime" => {
+                    if is_tv {
+                        base_url.push_str("&with_networks=1024");
+                    } else {
+                        base_url.push_str("&with_watch_providers=119|9&watch_region=US");
+                    }
+                }
+                "disney" => {
+                    if is_tv {
+                        base_url.push_str("&with_networks=2739");
+                    } else {
+                        base_url.push_str("&with_watch_providers=337&watch_region=US");
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Clean garbage genres for TV
+        if is_tv {
+            base_url.push_str("&without_genres=10763,10764,10766,10767");
+        }
+
+        // Genres
+        if let Some(ref genres) = params.genres {
+            if !genres.trim().is_empty() {
+                base_url.push_str(&format!("&with_genres={}", genres.trim()));
+            }
+        }
+
+        // Countries
+        if let Some(ref countries) = params.countries {
+            if !countries.trim().is_empty() {
+                base_url.push_str(&format!("&with_origin_country={}", countries.trim()));
+            }
+        }
+
+        // Years
+        if is_tv {
+            if let Some(yf) = params.year_from {
+                base_url.push_str(&format!("&first_air_date.gte={}-01-01", yf));
+            }
+            if let Some(yt) = params.year_to {
+                base_url.push_str(&format!("&first_air_date.lte={}-12-31", yt));
+            }
+        } else {
+            if let Some(yf) = params.year_from {
+                base_url.push_str(&format!("&primary_release_date.gte={}-01-01", yf));
+            }
+            if let Some(yt) = params.year_to {
+                base_url.push_str(&format!("&primary_release_date.lte={}-12-31", yt));
+            }
+        }
+
+        // Rating
+        if let Some(r) = params.min_rating {
+            base_url.push_str(&format!("&vote_average.gte={}", r));
+            base_url.push_str("&vote_count.gte=50");
+        } else {
+            base_url.push_str("&vote_count.gte=30");
+        }
+
+        // Sort by
+        let sort = params.sort_by.as_deref().unwrap_or("popularity.desc");
+        base_url.push_str(&format!("&sort_by={}", sort));
+
+        let _permit = self.tmdb_semaphore.acquire().await.ok();
+
+        let mut req = self.client.get(&base_url);
+        if self.config.api_key.len() > 40 {
+            req = req.header("Authorization", format!("Bearer {}", self.config.api_key));
+        } else {
+            req = req.query(&[("api_key", &self.config.api_key)]);
+        }
+
+        let resp = req.send().await?.error_for_status()?;
+        let val: serde_json::Value = resp.json().await?;
+
+        let page_num = val.get("page").and_then(|p| p.as_u64()).map(|p| p as u32).unwrap_or(page);
+        let total_pages = val.get("total_pages").and_then(|p| p.as_u64()).map(|p| p as u32);
+        let total_results = val.get("total_results").and_then(|p| p.as_u64());
+        let items = parse_tmdb_results_to_feed_items(&val, def_type);
+
+        Ok(FeedShelf {
+            id: "catalog_discover".to_string(),
+            title: "Каталог фильмов и сериалов".to_string(),
+            icon: if is_tv { "tv".to_string() } else { "film".to_string() },
+            items,
+            page: Some(page_num),
+            total_pages,
+            total_results,
+        })
     }
 }
 
@@ -1459,6 +1713,19 @@ pub struct FeedShelf {
     pub total_pages: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_results: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct DiscoverParams {
+    pub r#type: Option<String>,
+    pub network: Option<String>,
+    pub genres: Option<String>,
+    pub countries: Option<String>,
+    pub year_from: Option<u32>,
+    pub year_to: Option<u32>,
+    pub min_rating: Option<f32>,
+    pub sort_by: Option<String>,
+    pub page: Option<u32>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

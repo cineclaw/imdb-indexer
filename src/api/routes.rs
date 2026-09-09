@@ -1,7 +1,8 @@
 use crate::api::handlers::{
-    get_home_feeds_handler, get_movie_metadata_handler, get_person_handler, get_poster_handler,
-    get_series_episodes_handler, get_series_seasons_handler, get_shelf_page_handler, get_status,
-    health_check, resolve_tmdb_handler, search_movies, trigger_update, AppState,
+    get_catalog_discover_handler, get_home_feeds_handler, get_movie_metadata_handler,
+    get_person_handler, get_poster_handler, get_series_episodes_handler,
+    get_series_seasons_handler, get_shelf_page_handler, get_status, health_check,
+    resolve_tmdb_handler, search_movies, trigger_update, AppState,
 };
 use axum::routing::{get, post};
 use axum::Router;
@@ -22,6 +23,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/feeds", get(get_home_feeds_handler))
         .route("/feeds/:shelf_id", get(get_shelf_page_handler))
         .route("/api/feeds/:shelf_id", get(get_shelf_page_handler))
+        .route("/catalog/discover", get(get_catalog_discover_handler))
+        .route("/api/catalog/discover", get(get_catalog_discover_handler))
         .route("/poster/:tconst", get(get_poster_handler))
         .route("/movie/:tconst/metadata", get(get_movie_metadata_handler))
         .route("/api/movie/:tconst/metadata", get(get_movie_metadata_handler))
