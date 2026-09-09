@@ -24,7 +24,7 @@
 3. **Умное ранжирование популярных фильмов при опечатках**:
    - При опечатках культовый блокбастер с миллионами голосов ранжируется **выше**, чем неизвестный низкорейтинговый проект с 2 голосами, случайно совпавший точнее.
    - Двухфазный скоринг:
-     $$\text{FinalScore} = \text{BM25} \times \left(1.0 + w_{\text{votes}} \cdot \log_{10}(\text{num\_votes} + 1)\right) \times \left(\frac{\text{rating}}{10}\right)^{w_{\text{rating}}}$$
+     $$\text{FinalScore} = \text{BM25} \times \left(1.0 + w_{\text{votes}} \cdot \log_{10}(\text{votes} + 1)\right) \times \left(\frac{\text{rating}}{10}\right)^{w_{\text{rating}}}$$
 4. **Автономное скачивание и Blue-Green обновления**:
    - Периодическая проверка (`check_interval_hours: 24`) через HTTP `HEAD` с проверкой `ETag` и `Last-Modified`.
    - Blue-Green ротация поколений индекса (`gen_<timestamp>`): во время индексации поиск работает бесперебойно, переключение происходит атомарно.
