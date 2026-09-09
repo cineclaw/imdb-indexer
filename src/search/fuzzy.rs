@@ -41,6 +41,8 @@ pub struct PosterUrls {
     pub small: String,
     pub medium: String,
     pub large: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xl: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -139,6 +141,7 @@ impl SearchEngine {
                 small: format!("/poster/{}?size=w154&v=2", movie.tconst),
                 medium: format!("/poster/{}?size=w185&v=2", movie.tconst),
                 large: format!("/poster/{}?size=w342&v=2", movie.tconst),
+                xl: Some(format!("/poster/{}?size=w500&v=2", movie.tconst)),
             };
 
             hits.push(SearchHit {
