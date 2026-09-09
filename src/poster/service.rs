@@ -1448,8 +1448,43 @@ impl PosterService {
                     )
                 }
             }
+            "anime_hub" => {
+                if !is_tv && media_type == Some("movie") {
+                    (
+                        "Аниме & Мультфильмы",
+                        "tv",
+                        format!("https://api.themoviedb.org/3/discover/movie?language=ru-RU&with_genres=16&with_original_language=ja&sort_by=popularity.desc&vote_count.gte=20&page={}", page),
+                        "movie",
+                    )
+                } else {
+                    (
+                        "Аниме & Мультипликация",
+                        "tv",
+                        format!("https://api.themoviedb.org/3/discover/tv?language=ru-RU&with_genres=16&with_original_language=ja&sort_by=popularity.desc&vote_count.gte=20&page={}", page),
+                        "tv",
+                    )
+                }
+            }
+            "doc_hub" => {
+                if is_tv {
+                    (
+                        "Документальные сериалы",
+                        "film",
+                        format!("https://api.themoviedb.org/3/discover/tv?language=ru-RU&with_genres=99&sort_by=popularity.desc&vote_count.gte=10&page={}", page),
+                        "tv",
+                    )
+                } else {
+                    (
+                        "Документальное кино",
+                        "film",
+                        format!("https://api.themoviedb.org/3/discover/movie?language=ru-RU&with_genres=99&sort_by=popularity.desc&vote_count.gte=20&page={}", page),
+                        "movie",
+                    )
+                }
+            }
             _ => return Ok(None),
         };
+
 
         let _permit = self.tmdb_semaphore.acquire().await.ok();
 
