@@ -46,6 +46,5 @@ EXPOSE 8090
 
 ENV CONFIG_PATH=/app/config.yaml
 ENV DATA_DIR=/data
-ENV TMDB_CACHE_DIR=/data/posters
 
 ENTRYPOINT ["/app/imdb-indexer"]

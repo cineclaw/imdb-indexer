@@ -1,5 +1,5 @@
 use axum::body::Body;
-use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH, LAST_MODIFIED};
+use axum::http::header::CONTENT_TYPE;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use imdb_indexer::api::{create_router, AppState};
@@ -10,7 +10,6 @@ use imdb_indexer::poster::{
     normalize_poster_size, PosterService, POSTER_SIZE_LG, POSTER_SIZE_MD, POSTER_SIZE_ORIG,
     POSTER_SIZE_SM, POSTER_SIZE_XL, POSTER_SIZE_XS,
 };
-use std::fs;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -33,15 +32,14 @@ fn test_poster_size_normalization() {
 }
 
 #[tokio::test]
-async fn test_poster_cdn_fallback_svg() -> anyhow::Result<()> {
+async fn test_poster_fallback_svg() -> anyhow::Result<()> {
     let temp_dir = tempfile::tempdir()?;
     let mut config = Config::default();
     config.storage.data_dir = temp_dir.path().to_path_buf();
-    config.tmdb.cache_dir = temp_dir.path().join("posters");
 
     let manager = IndexManager::open_or_create(temp_dir.path().join("indices"))?;
     let pipeline = IngestionPipeline::new(config.clone());
-    let poster_service = PosterService::new(config.tmdb.clone());
+    let poster_service = PosterService::new(config.tmdb.clone(), None);
 
     let state = AppState {
         config,
@@ -53,7 +51,6 @@ async fn test_poster_cdn_fallback_svg() -> anyhow::Result<()> {
 
     let router = create_router(state);
 
-    // Request poster when not in cache and no TMDB key
     let response = router
         .clone()
         .oneshot(
@@ -70,7 +67,6 @@ async fn test_poster_cdn_fallback_svg() -> anyhow::Result<()> {
         response.headers().get(CONTENT_TYPE).unwrap(),
         "image/svg+xml; charset=utf-8"
     );
-    assert!(response.headers().get(CACHE_CONTROL).unwrap().to_str()?.contains("no-cache"));
 
     let body = response.into_body().collect().await?.to_bytes();
     let body_str = std::str::from_utf8(&body)?;
@@ -82,88 +78,39 @@ async fn test_poster_cdn_fallback_svg() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn test_poster_cdn_cached_file_and_304_not_modified() -> anyhow::Result<()> {
+async fn test_redb_persistent_poster_cache() -> anyhow::Result<()> {
     let temp_dir = tempfile::tempdir()?;
+    let db_path = temp_dir.path().join("poster_paths.redb");
+
     let mut config = Config::default();
     config.storage.data_dir = temp_dir.path().to_path_buf();
-    config.tmdb.cache_dir = temp_dir.path().join("posters");
 
-    let manager = IndexManager::open_or_create(temp_dir.path().join("indices"))?;
-    let pipeline = IngestionPipeline::new(config.clone());
-    let poster_service = PosterService::new(config.tmdb.clone());
+    // 1. First service instance: save paths into redb
+    {
+        let poster_service = PosterService::new(config.tmdb.clone(), Some(db_path.clone()));
+        poster_service.save_paths_to_cache(
+            "tt1375666",
+            Some("/piQXcdOGgv1O9HQ07pI0tnjkGJw.jpg"),
+            Some("/ii8QGacT3MXESqBckQlyrATY0lT.jpg"),
+        );
 
-    // Pre-populate mock cached poster on disk: data/posters/61/tt0111161_w185.jpg
-    let poster_path = poster_service.get_poster_path("tt0111161", "w185");
-    fs::create_dir_all(poster_path.parent().unwrap())?;
-    let dummy_jpeg_bytes = b"\xFF\xD8\xFF\xE0\x00\x10JFIF\x00mock_poster_data";
-    fs::write(&poster_path, dummy_jpeg_bytes)?;
+        let cached = poster_service.get_cached_paths("tt1375666");
+        assert!(cached.is_some());
+        let (poster, backdrop) = cached.unwrap();
+        assert_eq!(poster.as_deref(), Some("/piQXcdOGgv1O9HQ07pI0tnjkGJw.jpg"));
+        assert_eq!(backdrop.as_deref(), Some("/ii8QGacT3MXESqBckQlyrATY0lT.jpg"));
+    }
 
-    let state = AppState {
-        config,
-        manager: Arc::new(RwLock::new(manager)),
-        pipeline: Arc::new(pipeline),
-        is_indexing: Arc::new(AtomicBool::new(false)),
-        poster_service: Arc::new(poster_service),
-    };
-
-    let router = create_router(state);
-
-    // 1. Initial Request (should return 200 OK + cached image)
-    let response = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/poster/tt0111161?size=w185")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response.headers().get(CONTENT_TYPE).unwrap(), "image/jpeg");
-    let cache_control = response.headers().get(CACHE_CONTROL).unwrap().to_str()?;
-    assert!(cache_control.contains("max-age=2592000"));
-    assert!(cache_control.contains("immutable"));
-
-    let etag = response.headers().get(ETAG).unwrap().to_str()?.to_string();
-    assert!(etag.starts_with("W/\""));
-    assert!(response.headers().contains_key(LAST_MODIFIED));
-
-    let body = response.into_body().collect().await?.to_bytes();
-    assert_eq!(&body[..], dummy_jpeg_bytes);
-
-    // 2. Conditional Request with If-None-Match (should return 304 NOT MODIFIED with 0 bytes body!)
-    let response_304 = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/poster/tt0111161?size=w185")
-                .header(IF_NONE_MATCH, &etag)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response_304.status(), StatusCode::NOT_MODIFIED);
-    assert_eq!(response_304.headers().get(ETAG).unwrap(), etag.as_str());
-    let body_304 = response_304.into_body().collect().await?.to_bytes();
-    assert!(body_304.is_empty(), "304 response body must be 0 bytes!");
-
-    // 3. Request with .jpg extension alias: /poster/tt0111161.jpg
-    let response_ext = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/poster/tt0111161.jpg?size=w185")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response_ext.status(), StatusCode::OK);
-    assert_eq!(response_ext.headers().get(CONTENT_TYPE).unwrap(), "image/jpeg");
+    // 2. Second service instance (fresh memory, simulates server restart): read from persistent redb!
+    {
+        let poster_service_restart = PosterService::new(config.tmdb.clone(), Some(db_path.clone()));
+        let cached = poster_service_restart.get_cached_paths("tt1375666");
+        assert!(cached.is_some(), "Path must persist across service restarts in redb!");
+        let (poster, backdrop) = cached.unwrap();
+        assert_eq!(poster.as_deref(), Some("/piQXcdOGgv1O9HQ07pI0tnjkGJw.jpg"));
+        assert_eq!(backdrop.as_deref(), Some("/ii8QGacT3MXESqBckQlyrATY0lT.jpg"));
+    }
 
     Ok(())
 }
+

@@ -1,18 +1,14 @@
 use crate::config::TmdbConfig;
 use crate::index::schema::MovieDoc;
-use crate::ingestion::temp_store::parse_tconst_id;
+use crate::search::fuzzy::SearchHit;
 use anyhow::Result;
-use futures_util::StreamExt;
 use lru::LruCache;
+use redb::{Database, TableDefinition};
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex as SyncMutex};
-use std::time::{Duration, Instant, SystemTime};
-use tokio::fs::{self, File};
-use tokio::io::AsyncWriteExt;
-use tokio::sync::{broadcast, Mutex as AsyncMutex};
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 pub const POSTER_SIZE_XS: &str = "w92";   // ~5-10 KB
@@ -21,6 +17,9 @@ pub const POSTER_SIZE_MD: &str = "w185";  // ~20-30 KB (Recommended for search U
 pub const POSTER_SIZE_LG: &str = "w342";  // ~40-60 KB
 pub const POSTER_SIZE_XL: &str = "w500";  // ~80-120 KB
 pub const POSTER_SIZE_ORIG: &str = "original";
+
+const POSTER_PATHS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("poster_paths");
+const BACKDROP_PATHS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("backdrop_paths");
 
 /// Normalizes requested size string or aliases to standardized TMDB size
 pub fn normalize_poster_size(size_param: Option<&str>, default_size: &str) -> &'static str {
@@ -43,19 +42,12 @@ pub fn normalize_poster_size(size_param: Option<&str>, default_size: &str) -> &'
     }
 }
 
-pub struct PosterFileMetadata {
-    pub path: PathBuf,
-    pub size: u64,
-    pub mtime_system: SystemTime,
-    pub etag: String,
-}
-
 #[derive(Clone)]
 pub struct PosterService {
     config: TmdbConfig,
     client: reqwest::Client,
-    in_flight: Arc<AsyncMutex<HashMap<String, broadcast::Sender<bool>>>>,
-    negative_cache: Arc<SyncMutex<LruCache<u32, Instant>>>,
+    redb: Option<Arc<Database>>,
+    paths_cache: Arc<SyncMutex<LruCache<String, (Option<String>, Option<String>)>>>,
     seasons_cache: Arc<SyncMutex<LruCache<String, SeriesSeasonsResponse>>>,
     episodes_cache: Arc<SyncMutex<LruCache<String, Vec<EpisodeMetadataItem>>>>,
     movies_cache: Arc<SyncMutex<LruCache<String, MovieMetadataResponse>>>,
@@ -63,19 +55,18 @@ pub struct PosterService {
     resolved_cache: Arc<SyncMutex<LruCache<String, MovieDoc>>>,
     feeds_cache: Arc<SyncMutex<Option<(Instant, Vec<FeedShelf>)>>>,
     shelf_pages_cache: Arc<SyncMutex<LruCache<String, (Instant, FeedShelf)>>>,
-    poster_paths_cache: Arc<SyncMutex<LruCache<String, Option<String>>>>,
     tmdb_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl PosterService {
-    pub fn new(config: TmdbConfig) -> Self {
+    pub fn new(config: TmdbConfig, db_path: Option<PathBuf>) -> Self {
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(6))
+            .timeout(Duration::from_secs(4))
             .build()
             .unwrap_or_default();
 
-        let lru_capacity = NonZeroUsize::new(10_000).unwrap();
-        let negative_cache = Arc::new(SyncMutex::new(LruCache::new(lru_capacity)));
+        let lru_capacity = NonZeroUsize::new(20_000).unwrap();
+        let paths_cache = Arc::new(SyncMutex::new(LruCache::new(lru_capacity)));
         let seasons_cache = Arc::new(SyncMutex::new(LruCache::new(lru_capacity)));
         let episodes_cache = Arc::new(SyncMutex::new(LruCache::new(lru_capacity)));
         let movies_cache = Arc::new(SyncMutex::new(LruCache::new(lru_capacity)));
@@ -83,15 +74,37 @@ impl PosterService {
         let resolved_cache = Arc::new(SyncMutex::new(LruCache::new(lru_capacity)));
         let feeds_cache = Arc::new(SyncMutex::new(None));
         let shelf_pages_cache = Arc::new(SyncMutex::new(LruCache::new(lru_capacity)));
-        let poster_paths_cache = Arc::new(SyncMutex::new(LruCache::new(lru_capacity)));
-        let tmdb_semaphore = Arc::new(tokio::sync::Semaphore::new(6));
-        let in_flight = Arc::new(AsyncMutex::new(HashMap::new()));
+        let tmdb_semaphore = Arc::new(tokio::sync::Semaphore::new(12));
+
+        let redb = if let Some(path) = db_path {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match Database::create(&path) {
+                Ok(db) => {
+                    // Pre-create tables
+                    if let Ok(write_txn) = db.begin_write() {
+                        let _ = write_txn.open_table(POSTER_PATHS_TABLE);
+                        let _ = write_txn.open_table(BACKDROP_PATHS_TABLE);
+                        let _ = write_txn.commit();
+                    }
+                    info!("Persistent poster database opened at {:?}", path);
+                    Some(Arc::new(db))
+                }
+                Err(e) => {
+                    warn!("Failed to open poster_paths.redb at {:?}: {}", path, e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         Self {
             config,
             client,
-            in_flight,
-            negative_cache,
+            redb,
+            paths_cache,
             seasons_cache,
             episodes_cache,
             movies_cache,
@@ -99,7 +112,6 @@ impl PosterService {
             resolved_cache,
             feeds_cache,
             shelf_pages_cache,
-            poster_paths_cache,
             tmdb_semaphore,
         }
     }
@@ -108,263 +120,182 @@ impl PosterService {
         &self.config
     }
 
-    /// Sharded file path: data/posters/{shard}/{tconst}_{size}.jpg
-    pub fn get_poster_path(&self, tconst: &str, size: &str) -> PathBuf {
-        let num_id = parse_tconst_id(tconst).unwrap_or(0);
-        let shard = format!("{:02}", num_id % 100);
-        self.config
-            .cache_dir
-            .join(shard)
-            .join(format!("{}_{}.jpg", tconst, size))
-    }
-
-    /// Check if cached poster exists on disk and returns its metadata
-    pub async fn get_cached_metadata(&self, path: &Path) -> Option<PosterFileMetadata> {
-        if let Ok(meta) = fs::metadata(path).await {
-            if meta.is_file() && meta.len() > 0 {
-                let size = meta.len();
-                let mtime_system = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-                let mtime_duration = mtime_system
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default();
-                let etag = format!("W/\"{:x}-{:x}\"", mtime_duration.as_nanos(), size);
-
-                return Some(PosterFileMetadata {
-                    path: path.to_path_buf(),
-                    size,
-                    mtime_system,
-                    etag,
-                });
+    /// Read cached poster and backdrop paths from in-memory LRU or persistent redb (<1µs)
+    pub fn get_cached_paths(&self, tconst: &str) -> Option<(Option<String>, Option<String>)> {
+        // 1. Check in-memory LRU
+        {
+            let mut cache = self.paths_cache.lock().unwrap();
+            if let Some(cached) = cache.get(tconst) {
+                return Some(cached.clone());
             }
         }
+
+        // 2. Check redb if available
+        if let Some(ref db) = self.redb {
+            if let Ok(read_txn) = db.begin_read() {
+                if let Ok(p_table) = read_txn.open_table(POSTER_PATHS_TABLE) {
+                    if let Ok(Some(val)) = p_table.get(tconst) {
+                        let p_str = val.value().to_string();
+                        let poster = if p_str.is_empty() { None } else { Some(p_str) };
+
+                        let backdrop = if let Ok(b_table) = read_txn.open_table(BACKDROP_PATHS_TABLE) {
+                            if let Ok(Some(b_val)) = b_table.get(tconst) {
+                                let b_str = b_val.value().to_string();
+                                if b_str.is_empty() { None } else { Some(b_str) }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        let res = (poster, backdrop);
+                        // Populate in-memory LRU
+                        let mut cache = self.paths_cache.lock().unwrap();
+                        cache.put(tconst.to_string(), res.clone());
+                        return Some(res);
+                    }
+                }
+            }
+        }
+
         None
     }
 
-    /// Retrieve or download poster for IMDb ID
-    pub async fn get_or_fetch_poster(
-        &self,
-        tconst: &str,
-        size_param: Option<&str>,
-    ) -> Option<PosterFileMetadata> {
-        let size = normalize_poster_size(size_param, &self.config.default_size);
-        let poster_path = self.get_poster_path(tconst, size);
+    /// Save poster and backdrop paths to both in-memory LRU and persistent redb
+    pub fn save_paths_to_cache(&self, tconst: &str, poster: Option<&str>, backdrop: Option<&str>) {
+        let p_opt = poster.map(String::from);
+        let b_opt = backdrop.map(String::from);
 
-        // 1. Check local disk cache first
-        if let Some(meta) = self.get_cached_metadata(&poster_path).await {
-            return Some(meta);
-        }
-
-        // 2. Check negative cache
-        if let Some(id) = parse_tconst_id(tconst) {
-            let mut neg = self.negative_cache.lock().unwrap();
-            if let Some(time) = neg.get(&id) {
-                if time.elapsed() < Duration::from_secs(self.config.negative_cache_hours * 3600) {
-                    return None;
-                }
-            }
-        }
-
-        // 3. If TMDB API key is not configured, cannot fetch from TMDB
-        if self.config.api_key.trim().is_empty() {
-            warn!("TMDB API key is not configured. Cannot download poster for {}", tconst);
-            return None;
-        }
-
-        // 4. Request Coalescing (Single-Flight)
-        let flight_key = format!("{}_{}", tconst, size);
-        let mut rx = {
-            let mut in_flight_lock = self.in_flight.lock().await;
-            if let Some(sender) = in_flight_lock.get(&flight_key) {
-                // Another coroutine is already fetching this exact poster! Subscribe to result.
-                sender.subscribe()
-            } else {
-                let (tx, rx) = broadcast::channel(1);
-                in_flight_lock.insert(flight_key.clone(), tx);
-                drop(in_flight_lock);
-
-                // We are the fetcher task!
-                let service_clone = self.clone();
-                let tconst_str = tconst.to_string();
-                let flight_key_clone = flight_key.clone();
-
-                tokio::spawn(async move {
-                    let success = service_clone.fetch_and_cache(&tconst_str, size).await;
-
-                    let mut in_flight_lock = service_clone.in_flight.lock().await;
-                    if let Some(sender) = in_flight_lock.remove(&flight_key_clone) {
-                        let _ = sender.send(success);
-                    }
-                });
-
-                rx
-            }
-        };
-
-        // Wait for fetch completion signal
-        let _ = rx.recv().await;
-
-        // Check if file was successfully written
-        self.get_cached_metadata(&poster_path).await
-    }
-
-    /// Fetches poster URL from TMDB with Russian localization priority and streams image to disk
-    async fn fetch_and_cache(&self, tconst: &str, size: &str) -> bool {
-        // Limit concurrent calls to TMDB to prevent rate-limiting and connection stalls
-        let _permit = match self.tmdb_semaphore.acquire().await {
-            Ok(p) => p,
-            Err(_) => return false,
-        };
-
-        let poster_path_result = self.find_tmdb_poster_path(tconst).await;
-
-        match poster_path_result {
-            Ok(Some(tmdb_poster_path)) => {
-                let image_url = format!("https://image.tmdb.org/t/p/{}{}", size, tmdb_poster_path);
-                info!("Downloading poster for {} ({}) from {}", tconst, size, image_url);
-
-                match self.download_image_to_disk(&image_url, tconst, size).await {
-                    Ok(()) => true,
-                    Err(e) => {
-                        warn!("Failed to download image for {}: {}", tconst, e);
-                        false
-                    }
-                }
-            }
-            Ok(None) => {
-                info!("No poster found on TMDB for {}", tconst);
-                if let Some(id) = parse_tconst_id(tconst) {
-                    self.negative_cache.lock().unwrap().put(id, Instant::now());
-                }
-                false
-            }
-            Err(e) => {
-                warn!("TMDB find query error for {}: {}", tconst, e);
-                false
-            }
-        }
-    }
-
-    /// Queries TMDB to find the best poster path with Russian localization priority
-    async fn find_tmdb_poster_path(&self, tconst: &str) -> Result<Option<String>> {
-        // Fast-path: Check in-memory poster_paths_cache first
+        // 1. Save in in-memory LRU
         {
-            let mut cache = self.poster_paths_cache.lock().unwrap();
-            if let Some(cached) = cache.get(tconst) {
-                return Ok(cached.clone());
-            }
+            let mut cache = self.paths_cache.lock().unwrap();
+            cache.put(tconst.to_string(), (p_opt, b_opt));
         }
 
-        // Step 1: Query Find API by IMDb ID with language=ru-RU
+        // 2. Persist to redb
+        if let Some(ref db) = self.redb {
+            if let Ok(write_txn) = db.begin_write() {
+                let p_val = poster.unwrap_or("");
+                let b_val = backdrop.unwrap_or("");
+                if let Ok(mut p_table) = write_txn.open_table(POSTER_PATHS_TABLE) {
+                    let _ = p_table.insert(tconst, p_val);
+                }
+                if let Ok(mut b_table) = write_txn.open_table(BACKDROP_PATHS_TABLE) {
+                    let _ = b_table.insert(tconst, b_val);
+                }
+                let _ = write_txn.commit();
+            }
+        }
+    }
+
+    /// Single-call TMDB Find API lookup by IMDb ID (external_source=imdb_id&language=ru-RU)
+    pub async fn fetch_tmdb_find_paths(&self, tconst: &str) -> Result<(Option<String>, Option<String>)> {
+        if self.config.api_key.trim().is_empty() {
+            return Ok((None, None));
+        }
+
         let find_url = format!(
             "https://api.themoviedb.org/3/find/{}?external_source=imdb_id&language=ru-RU",
             tconst
         );
 
-        let mut req = self.client.get(&find_url);
-        if self.config.api_key.len() > 40 {
-            req = req.header("Authorization", format!("Bearer {}", self.config.api_key));
-        } else {
-            req = req.query(&[("api_key", &self.config.api_key)]);
-        }
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let _permit = self.tmdb_semaphore.acquire().await;
 
-        let resp = req.send().await?.error_for_status()?;
-        let find_data: TmdbFindResponse = resp.json().await?;
-
-        // Extract media info
-        let (tmdb_id, media_type, default_poster) = if let Some(m) = find_data.movie_results.into_iter().next() {
-            (m.id, "movie", m.poster_path)
-        } else if let Some(t) = find_data.tv_results.into_iter().next() {
-            (t.id, "tv", t.poster_path)
-        } else {
-            let mut cache = self.poster_paths_cache.lock().unwrap();
-            cache.put(tconst.to_string(), None);
-            return Ok(None);
-        };
-
-        // Step 2: Query /images with Russian priority
-        let images_url = format!(
-            "https://api.themoviedb.org/3/{}/{}/images?include_image_language=ru,en,null",
-            media_type, tmdb_id
-        );
-
-        let mut req_img = self.client.get(&images_url);
-        if self.config.api_key.len() > 40 {
-            req_img = req_img.header("Authorization", format!("Bearer {}", self.config.api_key));
-        } else {
-            req_img = req_img.query(&[("api_key", &self.config.api_key)]);
-        }
-
-        let resolved_path = if let Ok(resp_img) = req_img.send().await {
-            if let Ok(img_data) = resp_img.json::<TmdbImagesResponse>().await {
-                // 1st Priority: Russian localized poster
-                let ru_poster = img_data
-                    .posters
-                    .iter()
-                    .filter(|p| p.iso_639_1.as_deref() == Some("ru"))
-                    .max_by(|a, b| {
-                        a.vote_average
-                            .partial_cmp(&b.vote_average)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
-
-                if let Some(poster) = ru_poster {
-                    info!("Found Russian localized poster for {}: {}", tconst, poster.file_path);
-                    Some(poster.file_path.clone())
-                } else {
-                    // 2nd Priority: English or untyped poster
-                    let fallback_poster = img_data
-                        .posters
-                        .iter()
-                        .filter(|p| p.iso_639_1.as_deref() == Some("en") || p.iso_639_1.is_none())
-                        .max_by(|a, b| {
-                            a.vote_average
-                                .partial_cmp(&b.vote_average)
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        });
-
-                    fallback_poster.map(|p| p.file_path.clone()).or(default_poster)
-                }
+            let mut req = self.client.get(&find_url);
+            if self.config.api_key.len() > 40 {
+                req = req.header("Authorization", format!("Bearer {}", self.config.api_key));
             } else {
-                default_poster
+                req = req.query(&[("api_key", &self.config.api_key)]);
             }
-        } else {
-            default_poster
-        };
 
-        // Cache in memory for all future size requests
-        {
-            let mut cache = self.poster_paths_cache.lock().unwrap();
-            cache.put(tconst.to_string(), resolved_path.clone());
+            let resp = match req.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    if attempts < 3 {
+                        tokio::time::sleep(Duration::from_millis(300 * attempts)).await;
+                        continue;
+                    }
+                    return Err(e.into());
+                }
+            };
+
+            if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                if attempts < 3 {
+                    tokio::time::sleep(Duration::from_millis(500 * attempts)).await;
+                    continue;
+                }
+            }
+
+            let resp = resp.error_for_status()?;
+            let find_data: TmdbFindResponse = resp.json().await?;
+
+            if let Some(m) = find_data.movie_results.into_iter().next() {
+                return Ok((m.poster_path, m.backdrop_path));
+            } else if let Some(t) = find_data.tv_results.into_iter().next() {
+                return Ok((t.poster_path, t.backdrop_path));
+            } else {
+                return Ok((None, None));
+            }
         }
-
-        Ok(resolved_path)
     }
 
-    /// Streams image chunks directly from HTTP response to disk (Zero-RAM!)
-    async fn download_image_to_disk(&self, url: &str, tconst: &str, size: &str) -> Result<()> {
-        let final_path = self.get_poster_path(tconst, size);
-        if let Some(parent) = final_path.parent() {
-            fs::create_dir_all(parent).await?;
+    /// Queries TMDB to find the best poster path (returns from cache if already known)
+    pub async fn find_tmdb_poster_path(&self, tconst: &str) -> Result<Option<String>> {
+        if let Some((poster, _)) = self.get_cached_paths(tconst) {
+            return Ok(poster);
         }
 
-        static FILE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        let counter = FILE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let temp_path = final_path.with_extension(format!("tmp.{}.{}", std::process::id(), counter));
+        let (poster_opt, backdrop_opt) = self.fetch_tmdb_find_paths(tconst).await?;
+        self.save_paths_to_cache(tconst, poster_opt.as_deref(), backdrop_opt.as_deref());
+        Ok(poster_opt)
+    }
 
-        let resp = self.client.get(url).send().await?.error_for_status()?;
-        let mut file = File::create(&temp_path).await?;
-        let mut stream = resp.bytes_stream();
+    /// Enriches search hits concurrently in parallel (using join_all with standard timeout)
+    pub async fn enrich_search_hits(&self, hits: &mut [SearchHit]) {
+        let mut missing_indices = Vec::new();
 
-        while let Some(chunk_result) = stream.next().await {
-            let chunk = chunk_result?;
-            file.write_all(&chunk).await?;
+        for (idx, hit) in hits.iter_mut().enumerate() {
+            if let Some((poster, backdrop)) = self.get_cached_paths(&hit.movie.tconst) {
+                hit.apply_paths(poster, backdrop);
+            } else {
+                missing_indices.push(idx);
+            }
         }
 
-        file.flush().await?;
-        drop(file);
+        if missing_indices.is_empty() {
+            return;
+        }
 
-        fs::rename(&temp_path, &final_path).await?;
-        Ok(())
+        let futures = missing_indices.iter().map(|&idx| {
+            let tconst = hits[idx].movie.tconst.clone();
+            let service = self.clone();
+            async move {
+                let res = service.fetch_tmdb_find_paths(&tconst).await;
+                (idx, tconst, res)
+            }
+        });
+
+        let results = futures_util::future::join_all(futures).await;
+
+        for (idx, tconst, res) in results {
+            match res {
+                Ok((poster_opt, backdrop_opt)) => {
+                    self.save_paths_to_cache(
+                        &tconst,
+                        poster_opt.as_deref(),
+                        backdrop_opt.as_deref(),
+                    );
+                    hits[idx].apply_paths(poster_opt, backdrop_opt);
+                }
+                Err(e) => {
+                    warn!("Failed to fetch TMDB paths for {}: {}", tconst, e);
+                }
+            }
+        }
     }
 
     /// Generates a sleek dark cinema SVG fallback placeholder
@@ -448,6 +379,8 @@ impl PosterService {
                 episode_count: s.episode_count,
                 air_date: s.air_date,
                 poster_path: s.poster_path,
+                overview: s.overview,
+                vote_average: s.vote_average,
             })
             .collect();
 
@@ -551,6 +484,10 @@ impl PosterService {
                     overview: ep.overview,
                     air_date: ep.air_date,
                     still_path: ep.still_path,
+                    vote_average: ep.vote_average,
+                    vote_count: ep.vote_count,
+                    runtime: ep.runtime,
+                    episode_type: ep.episode_type,
                 });
             }
         }
@@ -684,6 +621,17 @@ impl PosterService {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
+        let runtime_minutes = raw_json.get("runtime")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
+            .or_else(|| {
+                raw_json.get("episode_run_time")
+                    .and_then(|v| v.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32)
+            });
+
         let genres: Vec<String> = raw_json.get("genres")
             .and_then(|v| v.as_array())
             .map(|arr| {
@@ -703,6 +651,17 @@ impl PosterService {
                     .and_then(|l| l.get("file_path").and_then(|s| s.as_str()))
                     .map(|s| s.to_string())
             });
+
+        let backdrops: Vec<String> = raw_json.get("images")
+            .and_then(|img| img.get("backdrops"))
+            .and_then(|b| b.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|item| item.get("file_path").and_then(|p| p.as_str()).map(|s| s.to_string()))
+                    .take(25)
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let mut cast = Vec::new();
         if let Some(cast_arr) = raw_json.get("credits")
@@ -910,6 +869,8 @@ impl PosterService {
             cast,
             crew,
             videos: sorted_videos,
+            runtime_minutes,
+            backdrops,
         };
 
         {
@@ -1817,6 +1778,10 @@ pub struct MovieMetadataResponse {
     pub crew: Vec<CrewMember>,
     #[serde(default)]
     pub videos: Vec<VideoItem>,
+    #[serde(default)]
+    pub runtime_minutes: Option<u32>,
+    #[serde(default)]
+    pub backdrops: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1857,6 +1822,10 @@ pub struct EpisodeMetadataItem {
     pub overview: Option<String>,
     pub air_date: Option<String>,
     pub still_path: Option<String>,
+    pub vote_average: Option<f32>,
+    pub vote_count: Option<u32>,
+    pub runtime: Option<u32>,
+    pub episode_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1874,6 +1843,10 @@ struct TmdbEpisodeRaw {
     pub overview: Option<String>,
     pub air_date: Option<String>,
     pub still_path: Option<String>,
+    pub vote_average: Option<f32>,
+    pub vote_count: Option<u32>,
+    pub runtime: Option<u32>,
+    pub episode_type: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1883,6 +1856,8 @@ pub struct SeriesSeasonItem {
     pub episode_count: u32,
     pub air_date: Option<String>,
     pub poster_path: Option<String>,
+    pub overview: Option<String>,
+    pub vote_average: Option<f32>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1970,6 +1945,8 @@ struct TmdbSeasonRaw {
     pub episode_count: u32,
     pub air_date: Option<String>,
     pub poster_path: Option<String>,
+    pub overview: Option<String>,
+    pub vote_average: Option<f32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1984,18 +1961,6 @@ struct TmdbFindResponse {
 struct TmdbMediaItem {
     id: u64,
     poster_path: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TmdbImagesResponse {
     #[serde(default)]
-    posters: Vec<TmdbPosterItem>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TmdbPosterItem {
-    file_path: String,
-    iso_639_1: Option<String>,
-    #[serde(default)]
-    vote_average: f32,
+    backdrop_path: Option<String>,
 }

@@ -7,7 +7,7 @@ storage:
 
 imdb:
   base_url: "https://datasets.imdbws.com"
-  auto_update: true
+  auto_update: false
   check_interval_hours: 24
 
 indexing:
@@ -33,7 +33,4 @@ tmdb:
   api_key: "db85bce5bf5bf9bac3c140447bf5ac5d"
   # Default poster size: w92 (xs), w154 (sm), w185 (md), w342, w500 (lg), original
   default_size: "w185"
-  cache_dir: "./data/posters"
-  cache_ttl_days: 30
-  negative_cache_hours: 24
 

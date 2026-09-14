@@ -5,15 +5,14 @@ use crate::search::{SearchEngine, SearchParams};
 use crate::poster::PosterService;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, ETAG, EXPIRES, IF_NONE_MATCH, LAST_MODIFIED, PRAGMA};
-use axum::http::{HeaderMap, Response, StatusCode};
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
+use axum::http::{Response, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tokio_util::io::ReaderStream;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -71,16 +70,26 @@ pub async fn health_check() -> impl IntoResponse {
     }))
 }
 
-pub async fn get_status(State(state): State<AppState>) -> impl IntoResponse {
-    let manager = state.manager.read().await;
-    let searcher = manager.reader().searcher();
-    let total_documents = searcher.num_docs();
+static LAST_TOTAL_DOCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+pub async fn get_status(State(state): State<AppState>) -> impl IntoResponse {
     let is_indexing = state.is_indexing.load(Ordering::SeqCst);
     let downloader_state = state.pipeline.downloader().get_state();
 
+    let total_documents = if let Ok(manager) = state.manager.try_read() {
+        let docs = manager.reader().searcher().num_docs();
+        LAST_TOTAL_DOCS.store(docs, Ordering::Relaxed);
+        docs
+    } else {
+        LAST_TOTAL_DOCS.load(Ordering::Relaxed)
+    };
+
     Json(StatusResponse {
-        status: "ready".to_string(),
+        status: if is_indexing {
+            "indexing".to_string()
+        } else {
+            "ready".to_string()
+        },
         service: "imdb-indexer".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         is_indexing,
@@ -115,7 +124,8 @@ pub async fn search_movies(
     let engine = SearchEngine::new(manager.reader(), manager.schema().clone());
 
     match engine.search(&params) {
-        Ok(hits) => {
+        Ok(mut hits) => {
+            state.poster_service.enrich_search_hits(&mut hits).await;
             let took_ms = start_time.elapsed().as_secs_f64() * 1000.0;
             let total_hits = hits.len();
             Json(SearchResponse {
@@ -187,62 +197,11 @@ pub async fn trigger_update(
     )
 }
 
-#[derive(Debug, Deserialize)]
-pub struct PosterQuery {
-    pub size: Option<String>,
-}
-
 pub async fn get_poster_handler(
-    State(state): State<AppState>,
     Path(tconst_raw): Path<String>,
-    Query(query): Query<PosterQuery>,
-    headers: HeaderMap,
 ) -> Response<Body> {
     let tconst = tconst_raw.trim_end_matches(".jpg");
-
-    // 1. Fetch or load cached poster
-    let poster_meta = state
-        .poster_service
-        .get_or_fetch_poster(tconst, query.size.as_deref())
-        .await;
-
-    if let Some(meta) = poster_meta {
-        // Check conditional headers for 304 Not Modified
-        if let Some(if_none_match) = headers.get(IF_NONE_MATCH).and_then(|h| h.to_str().ok()) {
-            if if_none_match.trim() == meta.etag.trim() {
-                return Response::builder()
-                    .status(StatusCode::NOT_MODIFIED)
-                    .header(ETAG, meta.etag)
-                    .header(CACHE_CONTROL, "public, max-age=2592000, immutable")
-                    .body(Body::empty())
-                    .unwrap_or_default();
-            }
-        }
-
-        // Stream file directly from disk to socket with Zero-RAM heap allocation!
-        match tokio::fs::File::open(&meta.path).await {
-            Ok(file) => {
-                let stream = ReaderStream::new(file);
-                let last_modified_http = chrono::DateTime::<chrono::Utc>::from(meta.mtime_system).to_rfc2822();
-
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header(CONTENT_TYPE, "image/jpeg")
-                    .header(CACHE_CONTROL, "public, max-age=2592000, immutable")
-                    .header(ETAG, meta.etag)
-                    .header(LAST_MODIFIED, last_modified_http)
-                    .body(Body::from_stream(stream))
-                    .unwrap_or_default()
-            }
-            Err(e) => {
-                tracing::warn!("Failed to open poster file {:?}: {}", meta.path, e);
-                render_svg_fallback(tconst)
-            }
-        }
-    } else {
-        // Fallback to SVG placeholder
-        render_svg_fallback(tconst)
-    }
+    render_svg_fallback(tconst)
 }
 
 fn render_svg_fallback(tconst: &str) -> Response<Body> {
@@ -250,11 +209,15 @@ fn render_svg_fallback(tconst: &str) -> Response<Body> {
     Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "image/svg+xml; charset=utf-8")
-        .header(CACHE_CONTROL, "no-cache, no-store, must-revalidate")
-        .header(PRAGMA, "no-cache")
-        .header(EXPIRES, "0")
+        .header(CACHE_CONTROL, "public, max-age=86400")
         .body(Body::from(svg))
         .unwrap_or_default()
+}
+
+pub async fn get_tmdb_image_handler(
+    Path(image_path): Path<String>,
+) -> Response<Body> {
+    render_svg_fallback(&image_path)
 }
 
 pub async fn get_series_seasons_handler(

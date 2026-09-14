@@ -280,7 +280,7 @@ async fn test_axum_http_endpoints() -> anyhow::Result<()> {
 
     let config = Config::default();
     let pipeline = IngestionPipeline::new(config.clone());
-    let poster_service = imdb_indexer::poster::PosterService::new(config.tmdb.clone());
+    let poster_service = imdb_indexer::poster::PosterService::new(config.tmdb.clone(), None);
     let state = AppState {
         config,
         manager: Arc::new(RwLock::new(manager)),

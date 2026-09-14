@@ -51,8 +51,39 @@ pub struct SearchHit {
     pub score: f32,
     pub bm25_score: f32,
     pub popularity_multiplier: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poster_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backdrop_path: Option<String>,
     pub poster_url: String,
     pub posters: PosterUrls,
+}
+
+impl SearchHit {
+    pub fn apply_paths(&mut self, poster: Option<String>, backdrop: Option<String>) {
+        self.poster_path = poster.clone();
+        self.backdrop_path = backdrop;
+        if let Some(ref p) = poster {
+            let clean = p.trim_start_matches('/');
+            self.poster_url = format!("https://image.tmdb.org/t/p/w185/{}", clean);
+            self.posters = PosterUrls {
+                thumbnail: format!("https://image.tmdb.org/t/p/w92/{}", clean),
+                small: format!("https://image.tmdb.org/t/p/w154/{}", clean),
+                medium: format!("https://image.tmdb.org/t/p/w185/{}", clean),
+                large: format!("https://image.tmdb.org/t/p/w342/{}", clean),
+                xl: Some(format!("https://image.tmdb.org/t/p/w500/{}", clean)),
+            };
+        } else {
+            self.poster_url = String::new();
+            self.posters = PosterUrls {
+                thumbnail: String::new(),
+                small: String::new(),
+                medium: String::new(),
+                large: String::new(),
+                xl: None,
+            };
+        }
+    }
 }
 
 pub struct SearchEngine {
@@ -135,22 +166,22 @@ impl SearchEngine {
             };
 
             let final_score = bm25_factor * match_quality * pop_mult * year_mult;
-            let poster_url = format!("/poster/{}?size=w185&v=2", movie.tconst);
-            let posters = PosterUrls {
-                thumbnail: format!("/poster/{}?size=w92&v=2", movie.tconst),
-                small: format!("/poster/{}?size=w154&v=2", movie.tconst),
-                medium: format!("/poster/{}?size=w185&v=2", movie.tconst),
-                large: format!("/poster/{}?size=w342&v=2", movie.tconst),
-                xl: Some(format!("/poster/{}?size=w500&v=2", movie.tconst)),
-            };
 
             hits.push(SearchHit {
                 movie,
                 score: final_score,
                 bm25_score,
                 popularity_multiplier: pop_mult,
-                poster_url,
-                posters,
+                poster_path: None,
+                backdrop_path: None,
+                poster_url: String::new(),
+                posters: PosterUrls {
+                    thumbnail: String::new(),
+                    small: String::new(),
+                    medium: String::new(),
+                    large: String::new(),
+                    xl: None,
+                },
             });
         }
 

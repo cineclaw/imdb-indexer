@@ -33,11 +33,6 @@ async fn main() -> Result<()> {
             config.storage.data_dir = std::path::PathBuf::from(data_dir);
         }
     }
-    if let Ok(tmdb_cache) = std::env::var("TMDB_CACHE_DIR") {
-        if !tmdb_cache.trim().is_empty() {
-            config.tmdb.cache_dir = std::path::PathBuf::from(tmdb_cache);
-        }
-    }
     if let Ok(tmdb_key) = std::env::var("TMDB_API_KEY") {
         if !tmdb_key.trim().is_empty() {
             config.tmdb.api_key = tmdb_key.trim().to_string();
@@ -49,7 +44,8 @@ async fn main() -> Result<()> {
     let manager = IndexManager::open_or_create(&indices_dir)?;
 
     let pipeline = IngestionPipeline::new(config.clone());
-    let poster_service = imdb_indexer::poster::PosterService::new(config.tmdb.clone());
+    let poster_db_path = config.storage.data_dir.join("poster_paths.redb");
+    let poster_service = imdb_indexer::poster::PosterService::new(config.tmdb.clone(), Some(poster_db_path));
 
     let state = AppState {
         config: config.clone(),

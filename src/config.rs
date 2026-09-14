@@ -16,9 +16,6 @@ pub struct Config {
 pub struct TmdbConfig {
     pub api_key: String,
     pub default_size: String,
-    pub cache_dir: PathBuf,
-    pub cache_ttl_days: u64,
-    pub negative_cache_hours: u64,
 }
 
 impl Default for TmdbConfig {
@@ -27,9 +24,6 @@ impl Default for TmdbConfig {
         Self {
             api_key,
             default_size: "w185".to_string(),
-            cache_dir: PathBuf::from("./data/posters"),
-            cache_ttl_days: 30,
-            negative_cache_hours: 24,
         }
     }
 }
