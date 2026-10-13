@@ -295,6 +295,23 @@ pub async fn get_movie_metadata_handler(
     }
 }
 
+pub async fn get_movie_recommendations_handler(
+    State(state): State<AppState>,
+    Path(tconst): Path<String>,
+) -> impl IntoResponse {
+    match state.poster_service.get_movie_recommendations(&tconst).await {
+        Ok(shelf) => Json(shelf).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("Failed to fetch movie recommendations: {}", e),
+                "tconst": tconst
+            })),
+        )
+            .into_response(),
+    }
+}
+
 pub async fn get_person_handler(
     State(state): State<AppState>,
     Path(person_id): Path<u64>,
@@ -347,10 +364,16 @@ pub async fn resolve_tmdb_handler(
     }
 }
 
+#[derive(Debug, serde::Deserialize)]
+pub struct FeedsQuery {
+    pub profile: Option<String>,
+}
+
 pub async fn get_home_feeds_handler(
     State(state): State<AppState>,
+    Query(query): Query<FeedsQuery>,
 ) -> impl IntoResponse {
-    match state.poster_service.get_home_feeds().await {
+    match state.poster_service.get_home_feeds(query.profile.as_deref()).await {
         Ok(feeds) => Json(feeds).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -401,6 +424,31 @@ pub async fn get_catalog_discover_handler(
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
                 "error": format!("Failed to discover catalog: {}", e)
+            })),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn get_trailer_stream_handler(
+    State(state): State<AppState>,
+    Path(trailer_id): Path<String>,
+) -> impl IntoResponse {
+    match state.poster_service.get_kinopoisk_trailer_stream(&trailer_id).await {
+        Ok(Some(stream_data)) => Json(stream_data).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "Trailer stream not found",
+                "trailer_id": trailer_id
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("Failed to resolve trailer stream: {}", e),
+                "trailer_id": trailer_id
             })),
         )
             .into_response(),

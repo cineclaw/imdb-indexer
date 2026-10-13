@@ -39,7 +39,7 @@ async fn test_poster_fallback_svg() -> anyhow::Result<()> {
 
     let manager = IndexManager::open_or_create(temp_dir.path().join("indices"))?;
     let pipeline = IngestionPipeline::new(config.clone());
-    let poster_service = PosterService::new(config.tmdb.clone(), None);
+    let poster_service = PosterService::new(config.tmdb.clone(), config.kinopoisk.clone(), None);
 
     let state = AppState {
         config,
@@ -87,7 +87,7 @@ async fn test_redb_persistent_poster_cache() -> anyhow::Result<()> {
 
     // 1. First service instance: save paths into redb
     {
-        let poster_service = PosterService::new(config.tmdb.clone(), Some(db_path.clone()));
+        let poster_service = PosterService::new(config.tmdb.clone(), config.kinopoisk.clone(), Some(db_path.clone()));
         poster_service.save_paths_to_cache(
             "tt1375666",
             Some("/piQXcdOGgv1O9HQ07pI0tnjkGJw.jpg"),
@@ -103,7 +103,7 @@ async fn test_redb_persistent_poster_cache() -> anyhow::Result<()> {
 
     // 2. Second service instance (fresh memory, simulates server restart): read from persistent redb!
     {
-        let poster_service_restart = PosterService::new(config.tmdb.clone(), Some(db_path.clone()));
+        let poster_service_restart = PosterService::new(config.tmdb.clone(), config.kinopoisk.clone(), Some(db_path.clone()));
         let cached = poster_service_restart.get_cached_paths("tt1375666");
         assert!(cached.is_some(), "Path must persist across service restarts in redb!");
         let (poster, backdrop) = cached.unwrap();

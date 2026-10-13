@@ -1,10 +1,11 @@
-use crate::config::TmdbConfig;
+use crate::config::{KinopoiskConfig, TmdbConfig};
 use crate::index::schema::MovieDoc;
 use crate::search::fuzzy::SearchHit;
 use anyhow::Result;
 use lru::LruCache;
 use redb::{Database, TableDefinition};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as SyncMutex};
@@ -45,6 +46,7 @@ pub fn normalize_poster_size(size_param: Option<&str>, default_size: &str) -> &'
 #[derive(Clone)]
 pub struct PosterService {
     config: TmdbConfig,
+    kp_config: KinopoiskConfig,
     client: reqwest::Client,
     redb: Option<Arc<Database>>,
     paths_cache: Arc<SyncMutex<LruCache<String, (Option<String>, Option<String>)>>>,
@@ -53,27 +55,30 @@ pub struct PosterService {
     movies_cache: Arc<SyncMutex<LruCache<String, MovieMetadataResponse>>>,
     persons_cache: Arc<SyncMutex<LruCache<u64, PersonDetailsResponse>>>,
     resolved_cache: Arc<SyncMutex<LruCache<String, MovieDoc>>>,
-    feeds_cache: Arc<SyncMutex<Option<(Instant, Vec<FeedShelf>)>>>,
+    feeds_cache: Arc<SyncMutex<HashMap<String, (Instant, Vec<FeedShelf>)>>>,
     shelf_pages_cache: Arc<SyncMutex<LruCache<String, (Instant, FeedShelf)>>>,
+    trailer_stream_cache: Arc<SyncMutex<LruCache<String, (Instant, TrailerStreamResponse)>>>,
     tmdb_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl PosterService {
-    pub fn new(config: TmdbConfig, db_path: Option<PathBuf>) -> Self {
+    pub fn new(config: TmdbConfig, kp_config: KinopoiskConfig, db_path: Option<PathBuf>) -> Self {
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(4))
+            .timeout(Duration::from_secs(10))
             .build()
             .unwrap_or_default();
 
         let lru_capacity = NonZeroUsize::new(20_000).unwrap();
+        let trailer_capacity = NonZeroUsize::new(1_000).unwrap();
         let paths_cache = Arc::new(SyncMutex::new(LruCache::new(lru_capacity)));
         let seasons_cache = Arc::new(SyncMutex::new(LruCache::new(lru_capacity)));
         let episodes_cache = Arc::new(SyncMutex::new(LruCache::new(lru_capacity)));
         let movies_cache = Arc::new(SyncMutex::new(LruCache::new(lru_capacity)));
         let persons_cache = Arc::new(SyncMutex::new(LruCache::new(lru_capacity)));
         let resolved_cache = Arc::new(SyncMutex::new(LruCache::new(lru_capacity)));
-        let feeds_cache = Arc::new(SyncMutex::new(None));
+        let feeds_cache = Arc::new(SyncMutex::new(HashMap::new()));
         let shelf_pages_cache = Arc::new(SyncMutex::new(LruCache::new(lru_capacity)));
+        let trailer_stream_cache = Arc::new(SyncMutex::new(LruCache::new(trailer_capacity)));
         let tmdb_semaphore = Arc::new(tokio::sync::Semaphore::new(12));
 
         let redb = if let Some(path) = db_path {
@@ -102,6 +107,7 @@ impl PosterService {
 
         Self {
             config,
+            kp_config,
             client,
             redb,
             paths_cache,
@@ -112,12 +118,17 @@ impl PosterService {
             resolved_cache,
             feeds_cache,
             shelf_pages_cache,
+            trailer_stream_cache,
             tmdb_semaphore,
         }
     }
 
     pub fn config(&self) -> &TmdbConfig {
         &self.config
+    }
+
+    pub fn kp_config(&self) -> &KinopoiskConfig {
+        &self.kp_config
     }
 
     /// Read cached poster and backdrop paths from in-memory LRU or persistent redb (<1µs)
@@ -540,12 +551,12 @@ impl PosterService {
 
         let details_url = if is_tv {
             format!(
-                "https://api.themoviedb.org/3/tv/{}?language=ru-RU&append_to_response=aggregate_credits,credits,videos,images&include_image_language=ru,en,null&include_video_language=ru,en,null",
+                "https://api.themoviedb.org/3/tv/{}?language=ru-RU&append_to_response=aggregate_credits,credits,videos,images,recommendations,similar&include_image_language=ru,en,null&include_video_language=ru,en,null",
                 media_id
             )
         } else {
             format!(
-                "https://api.themoviedb.org/3/movie/{}?language=ru-RU&append_to_response=credits,videos,images&include_image_language=ru,en,null&include_video_language=ru,en,null",
+                "https://api.themoviedb.org/3/movie/{}?language=ru-RU&append_to_response=credits,videos,images,recommendations,similar,release_dates&include_image_language=ru,en,null&include_video_language=ru,en,null",
                 media_id
             )
         };
@@ -811,7 +822,175 @@ impl PosterService {
             }
         }
 
-        let mut videos = Vec::new();
+        let mut tmdb_premiere_ru: Option<String> = None;
+        let mut tmdb_digital_release: Option<String> = None;
+
+        if let Some(rd_results) = raw_json.get("release_dates").and_then(|r| r.get("results")).and_then(|arr| arr.as_array()) {
+            for country_obj in rd_results {
+                let iso = country_obj.get("iso_3166_1").and_then(|s| s.as_str()).unwrap_or("");
+                if let Some(dates_arr) = country_obj.get("release_dates").and_then(|d| d.as_array()) {
+                    for entry in dates_arr {
+                        let r_type = entry.get("type").and_then(|t| t.as_u64()).unwrap_or(0);
+                        let date_str = entry.get("release_date").and_then(|d| d.as_str()).map(|s| {
+                            if s.len() >= 10 { s[..10].to_string() } else { s.to_string() }
+                        });
+                        if iso == "RU" {
+                            if (r_type == 3 || r_type == 1 || r_type == 2) && tmdb_premiere_ru.is_none() {
+                                tmdb_premiere_ru = date_str.clone();
+                            }
+                            if (r_type == 4 || r_type == 5) && tmdb_digital_release.is_none() {
+                                tmdb_digital_release = date_str.clone();
+                            }
+                        } else if iso == "US" {
+                            if (r_type == 4 || r_type == 5) && tmdb_digital_release.is_none() {
+                                tmdb_digital_release = date_str.clone();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut kp_id: Option<u64> = None;
+        let mut kp_rating: Option<f32> = None;
+        let mut kp_tickets_available: Option<bool> = None;
+        let mut kp_premiere_ru: Option<String> = None;
+        let mut kp_premiere_world: Option<String> = None;
+        let mut kp_digital_release: Option<String> = None;
+        let mut kp_videos: Vec<VideoItem> = Vec::new();
+
+        let kp_key = self.kp_config.api_key.trim();
+        if !kp_key.is_empty() {
+            let kp_search_url = format!("https://kinopoiskapiunofficial.tech/api/v2.2/films?imdbId={}", tconst);
+            if let Ok(kp_res) = self.client.get(&kp_search_url)
+                .header("X-API-KEY", kp_key)
+                .header("Content-Type", "application/json")
+                .send()
+                .await
+            {
+                if let Ok(kp_json) = kp_res.json::<serde_json::Value>().await {
+                    if let Some(first_item) = kp_json.get("items").and_then(|it| it.as_array()).and_then(|arr| arr.first()) {
+                        if let Some(id) = first_item.get("kinopoiskId").and_then(|v| v.as_u64()) {
+                            kp_id = Some(id);
+                            kp_rating = first_item.get("ratingKinopoisk").and_then(|v| v.as_f64()).map(|v| v as f32);
+
+                            // 1. Fetch details (tickets availability)
+                            let kp_film_url = format!("https://kinopoiskapiunofficial.tech/api/v2.2/films/{}", id);
+                            if let Ok(f_res) = self.client.get(&kp_film_url)
+                                .header("X-API-KEY", kp_key)
+                                .send()
+                                .await
+                            {
+                                if let Ok(f_json) = f_res.json::<serde_json::Value>().await {
+                                    kp_tickets_available = f_json.get("isTicketsAvailable").and_then(|b| b.as_bool());
+                                    if kp_rating.is_none() {
+                                        kp_rating = f_json.get("ratingKinopoisk").and_then(|v| v.as_f64()).map(|v| v as f32);
+                                    }
+                                }
+                            }
+
+                            // 2. Fetch distributions (premieres in RU / World / Digital)
+                            let kp_dist_url = format!("https://kinopoiskapiunofficial.tech/api/v2.2/films/{}/distributions", id);
+                            if let Ok(d_res) = self.client.get(&kp_dist_url)
+                                .header("X-API-KEY", kp_key)
+                                .send()
+                                .await
+                            {
+                                if let Ok(d_json) = d_res.json::<serde_json::Value>().await {
+                                    if let Some(items) = d_json.get("items").and_then(|it| it.as_array()) {
+                                        for d in items {
+                                            let d_type = d.get("type").and_then(|s| s.as_str()).unwrap_or("");
+                                            let sub_type = d.get("subType").and_then(|s| s.as_str()).unwrap_or("");
+                                            let d_date = d.get("date").and_then(|s| s.as_str()).map(|s| s.to_string());
+                                            let country = d.get("country").and_then(|c| c.get("country")).and_then(|s| s.as_str()).unwrap_or("");
+
+                                            if (d_type == "PREMIERE" || d_type == "COUNTRY_SPECIFIC") && country == "Россия" && kp_premiere_ru.is_none() {
+                                                kp_premiere_ru = d_date.clone();
+                                            }
+                                            if d_type == "WORLD_PREMIER" && kp_premiere_world.is_none() {
+                                                kp_premiere_world = d_date.clone();
+                                            }
+                                            if sub_type == "DIGITAL" && kp_digital_release.is_none() {
+                                                kp_digital_release = d_date.clone();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 3. Fetch videos (official Russian trailers)
+                            let kp_vids_url = format!("https://kinopoiskapiunofficial.tech/api/v2.2/films/{}/videos", id);
+                            if let Ok(v_res) = self.client.get(&kp_vids_url)
+                                .header("X-API-KEY", kp_key)
+                                .send()
+                                .await
+                            {
+                                if let Ok(v_json) = v_res.json::<serde_json::Value>().await {
+                                    if let Some(items) = v_json.get("items").and_then(|it| it.as_array()) {
+                                        for v in items {
+                                            let v_url = v.get("url").and_then(|s| s.as_str()).unwrap_or("");
+                                            let v_name = v.get("name").and_then(|s| s.as_str()).unwrap_or("Трейлер").to_string();
+
+                                            let trailer_id = if let Some(pos) = v_url.find("/trailer/") {
+                                                let rest = &v_url[pos + 9..];
+                                                rest.split('?').next().unwrap_or("").to_string()
+                                            } else {
+                                                String::new()
+                                            };
+
+                                            if !trailer_id.is_empty() {
+                                                kp_videos.push(VideoItem {
+                                                    id: format!("kp_{}", trailer_id),
+                                                    name: v_name,
+                                                    key: trailer_id,
+                                                    site: "Kinopoisk".to_string(),
+                                                    video_type: "Trailer".to_string(),
+                                                    official: true,
+                                                    published_at: None,
+                                                    stream_url: None,
+                                                    thumbnail_url: None,
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let final_premiere_world = release_date.or(kp_premiere_world);
+        let final_premiere_ru = kp_premiere_ru.or(tmdb_premiere_ru);
+        let final_digital_release = kp_digital_release.or(tmdb_digital_release);
+
+        // Theatrical status calculation
+        let mut in_theaters = kp_tickets_available.unwrap_or(false);
+        let today_utc = chrono::Utc::now().naive_utc().date();
+
+        let effective_theatrical_date = final_premiere_ru.as_deref().or(final_premiere_world.as_deref());
+        if let Some(t_str) = effective_theatrical_date {
+            if let Ok(t_date) = chrono::NaiveDate::parse_from_str(&t_str[..10.min(t_str.len())], "%Y-%m-%d") {
+                let days_since = (today_utc - t_date).num_days();
+                // Active theatrical window: between 3 days before premiere and 55 days after
+                if days_since >= -3 && days_since <= 55 {
+                    let digital_passed = final_digital_release.as_ref().map(|d| {
+                        if let Ok(d_date) = chrono::NaiveDate::parse_from_str(&d[..10.min(d.len())], "%Y-%m-%d") {
+                            today_utc > d_date
+                        } else {
+                            false
+                        }
+                    }).unwrap_or(false);
+
+                    if !digital_passed {
+                        in_theaters = true;
+                    }
+                }
+            }
+        }
+
+        let mut tmdb_videos = Vec::new();
         if let Some(vids_arr) = raw_json.get("videos")
             .and_then(|v| v.get("results"))
             .and_then(|va| va.as_array())
@@ -826,7 +1005,7 @@ impl PosterService {
                     let iso_lang = v.get("iso_639_1").and_then(|l| l.as_str()).unwrap_or("");
 
                     if !key.is_empty() {
-                        videos.push((
+                        tmdb_videos.push((
                             iso_lang == "ru",
                             official,
                             video_type == "Trailer",
@@ -838,20 +1017,55 @@ impl PosterService {
                                 video_type: video_type.to_string(),
                                 official,
                                 published_at: v.get("published_at").and_then(|p| p.as_str()).map(|s| s.to_string()),
+                                stream_url: None,
+                                thumbnail_url: None,
                             }
                         ));
                     }
                 }
             }
 
-            videos.sort_by(|a, b| {
+            tmdb_videos.sort_by(|a, b| {
                 b.0.cmp(&a.0)
                     .then_with(|| b.2.cmp(&a.2))
                     .then_with(|| b.1.cmp(&a.1))
             });
         }
 
-        let sorted_videos: Vec<VideoItem> = videos.into_iter().map(|(_, _, _, item)| item).take(6).collect();
+        let sorted_tmdb_videos: Vec<VideoItem> = tmdb_videos.into_iter().map(|(_, _, _, item)| item).collect();
+
+        // Combine videos: Prioritize Kinopoisk Russian dubbed trailers first, then TMDB videos
+        let mut combined_videos = Vec::new();
+        for kv in kp_videos {
+            combined_videos.push(kv);
+        }
+        for tv in sorted_tmdb_videos {
+            if !combined_videos.iter().any(|v| v.key == tv.key) {
+                combined_videos.push(tv);
+            }
+        }
+        let final_videos: Vec<VideoItem> = combined_videos.into_iter().take(8).collect();
+
+        let mut recommendations = if let Some(rec_val) = raw_json.get("recommendations") {
+            parse_tmdb_results_to_feed_items(rec_val, if is_tv { "tv" } else { "movie" })
+        } else {
+            Vec::new()
+        };
+
+        if recommendations.len() < 4 {
+            if let Some(sim_val) = raw_json.get("similar") {
+                let sim_items = parse_tmdb_results_to_feed_items(sim_val, if is_tv { "tv" } else { "movie" });
+                let existing_ids: std::collections::HashSet<u64> = recommendations.iter().map(|item| item.id).collect();
+                for item in sim_items {
+                    if !existing_ids.contains(&item.id) {
+                        recommendations.push(item);
+                        if recommendations.len() >= 12 {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
 
         let response = MovieMetadataResponse {
             tconst: tconst.to_string(),
@@ -859,7 +1073,12 @@ impl PosterService {
             title,
             original_title,
             overview,
-            premiered: release_date,
+            premiered: final_premiere_world,
+            premiered_ru: final_premiere_ru,
+            digital_release: final_digital_release,
+            in_theaters,
+            kinopoisk_id: kp_id,
+            kinopoisk_rating: kp_rating,
             year,
             rating,
             genres,
@@ -868,9 +1087,10 @@ impl PosterService {
             logo_path,
             cast,
             crew,
-            videos: sorted_videos,
+            videos: final_videos,
             runtime_minutes,
             backdrops,
+            recommendations,
         };
 
         {
@@ -879,6 +1099,130 @@ impl PosterService {
         }
 
         Ok(Some(response))
+    }
+
+    /// Extract 1080p unencrypted HLS stream and preview thumbnail from Kinopoisk trailer widget
+    pub async fn get_kinopoisk_trailer_stream(&self, trailer_id: &str) -> Result<Option<TrailerStreamResponse>> {
+        let clean_id = trailer_id.trim();
+        if clean_id.is_empty() {
+            return Ok(None);
+        }
+
+        // 1. Check in-memory LRU cache (3-hour TTL)
+        {
+            let mut cache = self.trailer_stream_cache.lock().unwrap();
+            if let Some((instant, cached)) = cache.get(clean_id) {
+                if instant.elapsed() < Duration::from_secs(3 * 3600) {
+                    return Ok(Some(cached.clone()));
+                }
+            }
+        }
+
+        // 2. Fetch widget page
+        let widget_url = format!("https://widgets.kinopoisk.ru/discovery/trailer/{}?onlyPlayer=1&cover=1", clean_id);
+        let resp = self.client.get(&widget_url)
+            .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            warn!("Failed to fetch kinopoisk trailer widget {}: status {}", clean_id, resp.status());
+            return Ok(None);
+        }
+
+        let html = resp.text().await?;
+
+        // 3. Extract streamUrl (.m3u8)
+        let stream_url = if let Some(idx) = html.find("streamUrl") {
+            let after = &html[idx + 9..];
+            if let Some(start_https) = after.find("https:") {
+                let stream_part = &after[start_https..];
+                let end_idx = stream_part.find(|c| c == '"' || c == '%' || c == '\\' || c == '&' || c == '\'')
+                    .unwrap_or(stream_part.len());
+                let raw_url = &stream_part[..end_idx];
+                Some(raw_url.replace(r"\/", "/"))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let stream_url = match stream_url {
+            Some(s) if s.contains(".m3u8") => s,
+            _ => {
+                // Secondary regex attempt for direct strm.yandex.ru m3u8
+                if let Some(pos) = html.find("https://strm.yandex.ru") {
+                    let part = &html[pos..];
+                    let end_idx = part.find(|c| c == '"' || c == '%' || c == '\\' || c == '&' || c == '\'')
+                        .unwrap_or(part.len());
+                    let raw = &part[..end_idx];
+                    if raw.contains(".m3u8") {
+                        raw.replace(r"\/", "/")
+                    } else {
+                        return Ok(None);
+                    }
+                } else {
+                    return Ok(None);
+                }
+            }
+        };
+
+        // 4. Extract thumbnail
+        let mut thumbnail_url = None;
+        let thumb_pattern = "//avatars.mds.yandex.net/get-kino-vod-films-gallery/";
+        if let Some(pos) = html.find(thumb_pattern) {
+            let part = &html[pos..];
+            let end_idx = part.find(|c| c == '"' || c == '%' || c == '\\' || c == '\'' || c == ' ' || c == '<')
+                .unwrap_or(part.len());
+            let raw_thumb = &part[..end_idx];
+            let mut full = format!("https:{}", raw_thumb.replace(r"\/", "/"));
+            if full.contains("100x56") {
+                full = full.replace("100x56", "540x304");
+            } else if full.contains("224x126") {
+                full = full.replace("224x126", "540x304");
+            }
+            thumbnail_url = Some(full);
+        }
+
+        let result = TrailerStreamResponse {
+            trailer_id: clean_id.to_string(),
+            stream_url,
+            thumbnail_url,
+        };
+
+        // 5. Store in cache
+        {
+            let mut cache = self.trailer_stream_cache.lock().unwrap();
+            cache.put(clean_id.to_string(), (Instant::now(), result.clone()));
+        }
+
+        Ok(Some(result))
+    }
+
+    pub async fn get_movie_recommendations(&self, tconst: &str) -> Result<FeedShelf> {
+        if let Some(metadata) = self.get_movie_metadata(tconst).await? {
+            let total = metadata.recommendations.len() as u64;
+            Ok(FeedShelf {
+                id: "recommendations".to_string(),
+                title: "Похожие фильмы и рекомендации".to_string(),
+                icon: "sparkles".to_string(),
+                items: metadata.recommendations,
+                page: Some(1),
+                total_pages: Some(1),
+                total_results: Some(total),
+            })
+        } else {
+            Ok(FeedShelf {
+                id: "recommendations".to_string(),
+                title: "Похожие фильмы и рекомендации".to_string(),
+                icon: "sparkles".to_string(),
+                items: Vec::new(),
+                page: Some(1),
+                total_pages: Some(1),
+                total_results: Some(0),
+            })
+        }
     }
 
     pub async fn get_person_details(&self, person_id: u64) -> Result<Option<PersonDetailsResponse>> {
@@ -1142,10 +1486,11 @@ impl PosterService {
         Ok(Some(doc))
     }
 
-    pub async fn get_home_feeds(&self) -> Result<Vec<FeedShelf>> {
+    pub async fn get_home_feeds(&self, profile: Option<&str>) -> Result<Vec<FeedShelf>> {
+        let profile_key = profile.unwrap_or("default");
         {
             let cache = self.feeds_cache.lock().unwrap();
-            if let Some((ts, ref shelves)) = *cache {
+            if let Some((ts, ref shelves)) = cache.get(profile_key) {
                 if ts.elapsed() < Duration::from_secs(7200) {
                     return Ok(shelves.clone());
                 }
@@ -1157,38 +1502,76 @@ impl PosterService {
             return Ok(Vec::new());
         }
 
-        let _today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-
-        let urls = vec![
-            (
-                "trending",
-                "В тренде на этой неделе",
-                "flame",
-                "https://api.themoviedb.org/3/trending/all/week?language=ru-RU".to_string(),
-                "movie",
-            ),
-            (
-                "apple_tv",
-                "Apple TV+ Originals",
-                "star",
-                "https://api.themoviedb.org/3/discover/tv?language=ru-RU&with_networks=2552&sort_by=popularity.desc".to_string(),
-                "tv",
-            ),
-            (
-                "popular_series",
-                "Популярные сериалы",
-                "tv",
-                "https://api.themoviedb.org/3/discover/tv?language=ru-RU&sort_by=popularity.desc&without_genres=10763,10764,10766,10767&vote_count.gte=50".to_string(),
-                "tv",
-            ),
-            (
-                "hbo_max",
-                "HBO / Max Originals",
-                "star",
-                "https://api.themoviedb.org/3/discover/tv?language=ru-RU&with_networks=49&sort_by=popularity.desc".to_string(),
-                "tv",
-            ),
-        ];
+        let urls = if profile_key == "kids" {
+            vec![
+                (
+                    "kids_magic",
+                    "Волшебные миры Disney & Pixar",
+                    "sparkles",
+                    "https://api.themoviedb.org/3/discover/movie?language=ru-RU&with_companies=2|3&with_genres=16|10751&sort_by=popularity.desc".to_string(),
+                    "movie",
+                ),
+                (
+                    "kids_family",
+                    "Семейное кино и сказки",
+                    "heart",
+                    "https://api.themoviedb.org/3/discover/movie?language=ru-RU&with_genres=10751,14&without_genres=27,53&sort_by=popularity.desc&vote_count.gte=50".to_string(),
+                    "movie",
+                ),
+                (
+                    "kids_russian",
+                    "Российская анимация и сказки",
+                    "star",
+                    "https://api.themoviedb.org/3/discover/movie?language=ru-RU&with_original_language=ru&with_genres=16|10751&sort_by=popularity.desc".to_string(),
+                    "movie",
+                ),
+                (
+                    "kids_series",
+                    "Любимые мультсериалы",
+                    "tv",
+                    "https://api.themoviedb.org/3/discover/tv?language=ru-RU&with_genres=16,10762&without_genres=10763,10764,10767&sort_by=popularity.desc&vote_count.gte=30".to_string(),
+                    "tv",
+                ),
+                (
+                    "kids_action",
+                    "Экшен, аниме и супергерои",
+                    "flame",
+                    "https://api.themoviedb.org/3/discover/movie?language=ru-RU&with_genres=16,28&sort_by=popularity.desc".to_string(),
+                    "movie",
+                ),
+            ]
+        } else {
+            vec![
+                (
+                    "trending",
+                    "В тренде на этой неделе",
+                    "flame",
+                    "https://api.themoviedb.org/3/trending/all/week?language=ru-RU".to_string(),
+                    "movie",
+                ),
+                (
+                    "apple_tv",
+                    "Apple TV+ Originals",
+                    "star",
+                    "https://api.themoviedb.org/3/discover/tv?language=ru-RU&with_networks=2552&sort_by=popularity.desc".to_string(),
+                    "tv",
+                ),
+                (
+                    "popular_series",
+                    "Популярные сериалы",
+                    "tv",
+                    "https://api.themoviedb.org/3/discover/tv?language=ru-RU&sort_by=popularity.desc&without_genres=10763,10764,10766,10767&vote_count.gte=50".to_string(),
+                    "tv",
+                ),
+                (
+                    "hbo_max",
+                    "HBO / Max Originals",
+                    "star",
+                    "https://api.themoviedb.org/3/discover/tv?language=ru-RU&with_networks=49&sort_by=popularity.desc".to_string(),
+                    "tv",
+                ),
+            ]
+        };
 
         let fetches = urls.into_iter().map(|(id, title, icon, url, def_type)| {
             let mut req = self.client.get(&url);
@@ -1229,7 +1612,7 @@ impl PosterService {
 
         {
             let mut cache = self.feeds_cache.lock().unwrap();
-            *cache = Some((Instant::now(), shelves.clone()));
+            cache.insert(profile_key.to_string(), (Instant::now(), shelves.clone()));
         }
 
         Ok(shelves)
@@ -1443,6 +1826,42 @@ impl PosterService {
                     )
                 }
             }
+            "kids_cartoons" => (
+                "Популярные мультфильмы",
+                "sparkles",
+                format!("https://api.themoviedb.org/3/discover/movie?language=ru-RU&with_genres=16&sort_by=popularity.desc&vote_count.gte=50&page={}", page),
+                "movie",
+            ),
+            "kids_russian" => (
+                "Российская анимация и сказки",
+                "star",
+                format!("https://api.themoviedb.org/3/discover/movie?language=ru-RU&with_original_language=ru&with_genres=16%7C10751&sort_by=popularity.desc&page={}", page),
+                "movie",
+            ),
+            "kids_series" => (
+                "Любимые мультсериалы",
+                "tv",
+                format!("https://api.themoviedb.org/3/discover/tv?language=ru-RU&with_genres=16,10762&without_genres=10763,10764,10767&sort_by=popularity.desc&vote_count.gte=30&page={}", page),
+                "tv",
+            ),
+            "kids_magic" => (
+                "Волшебные миры Disney & Pixar",
+                "sparkles",
+                format!("https://api.themoviedb.org/3/discover/movie?language=ru-RU&with_companies=2%7C3&with_genres=16%7C10751&sort_by=popularity.desc&page={}", page),
+                "movie",
+            ),
+            "kids_action" => (
+                "Экшен, аниме и супергерои",
+                "flame",
+                format!("https://api.themoviedb.org/3/discover/movie?language=ru-RU&with_genres=16,28&sort_by=popularity.desc&page={}", page),
+                "movie",
+            ),
+            "kids_family" => (
+                "Семейное кино и сказки",
+                "heart",
+                format!("https://api.themoviedb.org/3/discover/movie?language=ru-RU&with_genres=10751,14&without_genres=27,53&sort_by=popularity.desc&vote_count.gte=50&page={}", page),
+                "movie",
+            ),
             _ => return Ok(None),
         };
 
@@ -1766,6 +2185,12 @@ pub struct MovieMetadataResponse {
     pub original_title: String,
     pub overview: Option<String>,
     pub premiered: Option<String>,
+    pub premiered_ru: Option<String>,
+    pub digital_release: Option<String>,
+    #[serde(default)]
+    pub in_theaters: bool,
+    pub kinopoisk_id: Option<u64>,
+    pub kinopoisk_rating: Option<f32>,
     pub year: Option<u32>,
     pub rating: Option<f32>,
     pub genres: Vec<String>,
@@ -1782,6 +2207,8 @@ pub struct MovieMetadataResponse {
     pub runtime_minutes: Option<u32>,
     #[serde(default)]
     pub backdrops: Vec<String>,
+    #[serde(default)]
+    pub recommendations: Vec<FeedItem>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1812,6 +2239,17 @@ pub struct VideoItem {
     pub video_type: String,
     pub official: bool,
     pub published_at: Option<String>,
+    #[serde(default)]
+    pub stream_url: Option<String>,
+    #[serde(default)]
+    pub thumbnail_url: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TrailerStreamResponse {
+    pub trailer_id: String,
+    pub stream_url: String,
+    pub thumbnail_url: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
