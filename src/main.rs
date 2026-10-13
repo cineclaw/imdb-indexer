@@ -38,6 +38,11 @@ async fn main() -> Result<()> {
             config.tmdb.api_key = tmdb_key.trim().to_string();
         }
     }
+    if let Ok(kp_key) = std::env::var("KINOPOISK_API_KEY") {
+        if !kp_key.trim().is_empty() {
+            config.kinopoisk.api_key = kp_key.trim().to_string();
+        }
+    }
 
     // Initialize index directory
     let indices_dir = config.storage.data_dir.join("indices");
@@ -45,7 +50,11 @@ async fn main() -> Result<()> {
 
     let pipeline = IngestionPipeline::new(config.clone());
     let poster_db_path = config.storage.data_dir.join("poster_paths.redb");
-    let poster_service = imdb_indexer::poster::PosterService::new(config.tmdb.clone(), Some(poster_db_path));
+    let poster_service = imdb_indexer::poster::PosterService::new(
+        config.tmdb.clone(),
+        config.kinopoisk.clone(),
+        Some(poster_db_path),
+    );
 
     let state = AppState {
         config: config.clone(),

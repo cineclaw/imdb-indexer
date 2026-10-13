@@ -10,6 +10,20 @@ pub struct Config {
     pub search: SearchConfig,
     #[serde(default)]
     pub tmdb: TmdbConfig,
+    #[serde(default)]
+    pub kinopoisk: KinopoiskConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KinopoiskConfig {
+    pub api_key: String,
+}
+
+impl Default for KinopoiskConfig {
+    fn default() -> Self {
+        let api_key = std::env::var("KINOPOISK_API_KEY").unwrap_or_default();
+        Self { api_key }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,6 +118,7 @@ impl Default for Config {
                 rating_boost_weight: 0.5,
             },
             tmdb: TmdbConfig::default(),
+            kinopoisk: KinopoiskConfig::default(),
         }
     }
 }
@@ -118,6 +133,11 @@ impl Config {
                         if cfg.tmdb.api_key.is_empty() {
                             if let Ok(env_key) = std::env::var("TMDB_API_KEY") {
                                 cfg.tmdb.api_key = env_key;
+                            }
+                        }
+                        if cfg.kinopoisk.api_key.is_empty() {
+                            if let Ok(env_key) = std::env::var("KINOPOISK_API_KEY") {
+                                cfg.kinopoisk.api_key = env_key;
                             }
                         }
                         tracing::info!("Loaded config from {:?}", path);

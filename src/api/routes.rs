@@ -1,8 +1,9 @@
 use crate::api::handlers::{
     get_catalog_discover_handler, get_home_feeds_handler, get_movie_metadata_handler,
-    get_person_handler, get_poster_handler, get_series_episodes_handler,
-    get_series_seasons_handler, get_shelf_page_handler, get_status, get_tmdb_image_handler,
-    health_check, resolve_tmdb_handler, search_movies, trigger_update, AppState,
+    get_movie_recommendations_handler, get_person_handler, get_poster_handler,
+    get_series_episodes_handler, get_series_seasons_handler, get_shelf_page_handler, get_status,
+    get_tmdb_image_handler, get_trailer_stream_handler, health_check, resolve_tmdb_handler, search_movies, trigger_update,
+    AppState,
 };
 use axum::routing::{get, post};
 use axum::Router;
@@ -30,6 +31,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/tmdb/image/*image_path", get(get_tmdb_image_handler))
         .route("/movie/:tconst/metadata", get(get_movie_metadata_handler))
         .route("/api/movie/:tconst/metadata", get(get_movie_metadata_handler))
+        .route("/movie/:tconst/recommendations", get(get_movie_recommendations_handler))
+        .route("/api/movie/:tconst/recommendations", get(get_movie_recommendations_handler))
+        .route("/trailer/:trailer_id/stream", get(get_trailer_stream_handler))
+        .route("/api/trailer/:trailer_id/stream", get(get_trailer_stream_handler))
         .route("/series/:tconst/seasons", get(get_series_seasons_handler))
         .route("/api/series/:tconst/seasons", get(get_series_seasons_handler))
         .route("/series/:tconst/episodes", get(get_series_episodes_handler))
